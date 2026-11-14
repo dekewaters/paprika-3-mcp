@@ -5,7 +5,8 @@
 // Windows Smart App Control blocks unsigned executables (node.exe is signed).
 //
 // Tools: search_paprika_recipes, get_paprika_recipe, create_paprika_recipe,
-// update_paprika_recipe. There is deliberately no delete tool.
+// update_paprika_recipe, list_paprika_categories, create_paprika_category.
+// There is deliberately no delete tool for recipes or categories.
 //
 // Credentials come from PAPRIKA_USERNAME and PAPRIKA_PASSWORD only.
 // The only host contacted is paprikaapp.com. Logs go to stderr.
@@ -15,7 +16,7 @@ const crypto = require('node:crypto');
 const zlib = require('node:zlib');
 const readline = require('node:readline');
 
-const VERSION = '0.3.0-node';
+const VERSION = '0.4.0-node';
 const API = 'https://paprikaapp.com/api';
 const CACHE_TTL_MS = 2 * 60 * 1000;
 const PROTOCOL_VERSION = '2024-11-05';
@@ -97,6 +98,24 @@ class PaprikaClient {
     return this.request('GET', `/v2/sync/recipe/${encodeURIComponent(uid)}/`);
   }
 
+  listCategories() {
+    return this.request('GET', '/v2/sync/categories/');
+  }
+
+  // Uploads category objects (new or changed). Paprika expects a gzipped
+  // JSON array in a multipart "data" field, like recipes.
+  async saveCategories(categories) {
+    const gz = zlib.gzipSync(Buffer.from(JSON.stringify(categories)));
+    const form = new FormData();
+    form.append('data', new Blob([gz]), 'data');
+    await this.request('POST', '/v2/sync/categories/', { body: form });
+    try {
+      await this.request('POST', '/v2/sync/notify/');
+    } catch (err) {
+      log('notify failed (non-fatal):', err.message);
+    }
+  }
+
   // Saves the full recipe object as given. Callers must start from the
   // current server copy so nothing is lost.
   async saveRecipe(recipe) {
@@ -125,6 +144,7 @@ const TOOLS = [
       type: 'object',
       properties: {
         query: { type: 'string', description: 'Words to search for. All words must match (case-insensitive). Empty lists all recipes.' },
+        category: { type: 'string', description: 'Only recipes in this category (exact name, case-insensitive). Use "(none)" for uncategorized recipes.' },
         limit: { type: 'number', description: 'Maximum results to return (default 25).' },
       },
     },
@@ -163,9 +183,22 @@ const TOOLS = [
         servings: { type: 'string' }, prep_time: { type: 'string' }, cook_time: { type: 'string' },
         total_time: { type: 'string' }, difficulty: { type: 'string' }, source: { type: 'string' },
         source_url: { type: 'string' }, rating: { type: 'number', description: '0-5' },
+        set_categories: { type: 'array', items: { type: 'string' }, description: 'Category names that REPLACE the recipe\'s categories. Names must already exist (see list_paprika_categories).' },
+        add_categories: { type: 'array', items: { type: 'string' }, description: 'Category names to add, keeping existing ones.' },
+        remove_categories: { type: 'array', items: { type: 'string' }, description: 'Category names to take off this recipe (the category itself is kept).' },
       },
       required: ['uid'],
     },
+  },
+  {
+    name: 'list_paprika_categories',
+    description: 'List all Paprika categories with how many recipes use each.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'create_paprika_category',
+    description: 'Create a new top-level Paprika category. Refuses if a category with that name already exists.',
+    inputSchema: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] },
   },
 ];
 
@@ -221,6 +254,58 @@ class RecipeServer {
     this.client = client;
     this.cache = new Map(); // uid -> { hash, trashed, recipe }
     this.refreshedAt = 0;
+    this.categories = new Map(); // uid -> category object
+    this.categoriesAt = 0;
+  }
+
+  async refreshCategories(force = false) {
+    if (!force && Date.now() - this.categoriesAt < CACHE_TTL_MS) return;
+    const list = (await this.client.listCategories()) || [];
+    this.categories = new Map(list.map((c) => [c.uid, c]));
+    this.categoriesAt = Date.now();
+  }
+
+  categoryNames(recipe) {
+    return (recipe.categories || []).map((u) => (this.categories.get(u) || { name: `(unknown ${u})` }).name);
+  }
+
+  // Resolves names to uids. Throws listing any names that don't exist.
+  resolveCategories(names) {
+    const byName = new Map([...this.categories.values()].map((c) => [c.name.toLowerCase(), c.uid]));
+    const missing = names.filter((n) => !byName.has(String(n).trim().toLowerCase()));
+    if (missing.length) throw new Error(`unknown categories: ${missing.join(', ')}. Create them first with create_paprika_category.`);
+    return names.map((n) => byName.get(String(n).trim().toLowerCase()));
+  }
+
+  async listCategories() {
+    await this.refreshCategories(true);
+    await this.refresh();
+    const counts = new Map();
+    for (const c of this.cache.values()) {
+      if (c.trashed) continue;
+      for (const u of c.recipe.categories || []) counts.set(u, (counts.get(u) || 0) + 1);
+    }
+    const cats = [...this.categories.values()].sort((a, b) => a.name.localeCompare(b.name));
+    if (!cats.length) return 'No categories yet.';
+    return cats.map((c) => `- ${c.name} (${counts.get(c.uid) || 0} recipes)${c.parent_uid ? ' [sub-category]' : ''}`).join('\n');
+  }
+
+  async createCategory(args) {
+    const name = String(args.name || '').trim();
+    if (!name) throw new Error('name is required');
+    await this.refreshCategories(true);
+    if ([...this.categories.values()].some((c) => c.name.toLowerCase() === name.toLowerCase())) {
+      throw new Error(`a category named "${name}" already exists`);
+    }
+    const maxOrder = Math.max(-1, ...[...this.categories.values()].map((c) => Number(c.order_flag) || 0));
+    const cat = { uid: crypto.randomUUID().toUpperCase(), name, order_flag: maxOrder + 1, parent_uid: null };
+    await this.client.saveCategories([cat]);
+    await this.refreshCategories(true);
+    if (![...this.categories.values()].some((c) => c.uid === cat.uid)) {
+      throw new Error('Paprika accepted the request but the category did not appear. Not retrying.');
+    }
+    log('created category', name);
+    return `Created category "${name}".`;
   }
 
   async refresh(force = false) {
@@ -246,7 +331,19 @@ class RecipeServer {
     await this.refresh();
     const limit = Number(args.limit) > 0 ? Math.floor(Number(args.limit)) : 25;
     const live = [...this.cache.values()].filter((c) => !c.trashed).map((c) => c.recipe);
-    let hits = live.filter((r) => matches(r, args.query)).sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
+    await this.refreshCategories();
+    let pool = live;
+    if (typeof args.category === 'string' && args.category.trim()) {
+      const want = args.category.trim().toLowerCase();
+      if (want === '(none)') {
+        pool = live.filter((r) => !(r.categories || []).length);
+      } else {
+        const cat = [...this.categories.values()].find((c) => c.name.toLowerCase() === want);
+        if (!cat) throw new Error(`no category named "${args.category}". Use list_paprika_categories.`);
+        pool = live.filter((r) => (r.categories || []).includes(cat.uid));
+      }
+    }
+    let hits = pool.filter((r) => matches(r, args.query)).sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
     let head = `${hits.length} of ${live.length} recipes match`;
     if (hits.length > limit) {
       head += ` (showing first ${limit})`;
@@ -254,6 +351,8 @@ class RecipeServer {
     }
     const lines = hits.map((r) => {
       let line = `- ${r.name} | uid: ${r.uid} | rating: ${r.rating || 0}`;
+      const cats = this.categoryNames(r);
+      if (cats.length) line += ` | categories: ${cats.join(', ')}`;
       if (r.source) line += ` | source: ${r.source}`;
       if (r.source_url) line += ` | ${r.source_url}`;
       return line;
@@ -265,7 +364,9 @@ class RecipeServer {
     if (!args.uid) throw new Error('uid is required');
     const r = await this.client.getRecipe(args.uid);
     if (r.in_trash) throw new Error('that recipe is in the Paprika trash');
-    return formatRecipe(r);
+    await this.refreshCategories();
+    const cats = this.categoryNames(r);
+    return (cats.length ? `categories: ${cats.join(', ')}\n` : 'categories: (none)\n') + formatRecipe(r);
   }
 
   async create(args) {
@@ -284,12 +385,28 @@ class RecipeServer {
     const current = await this.client.getRecipe(args.uid);
     if (current.in_trash) throw new Error('that recipe is in the Paprika trash; not updating it');
     const changed = applyUpdate(current, args);
+    const lists = ['set_categories', 'add_categories', 'remove_categories'].filter((k) => Array.isArray(args[k]));
+    if (lists.length) {
+      await this.refreshCategories();
+      let cats = [...(current.categories || [])];
+      if (Array.isArray(args.set_categories)) cats = this.resolveCategories(args.set_categories);
+      if (Array.isArray(args.add_categories)) {
+        for (const u of this.resolveCategories(args.add_categories)) if (!cats.includes(u)) cats.push(u);
+      }
+      if (Array.isArray(args.remove_categories)) {
+        const drop = new Set(this.resolveCategories(args.remove_categories));
+        cats = cats.filter((u) => !drop.has(u));
+      }
+      current.categories = cats;
+      changed.push(...lists);
+    }
     if (!changed.length) throw new Error('no fields to update were given');
     if (!current.name) throw new Error('a recipe name cannot be empty');
     const saved = await this.client.saveRecipe(current);
     this.refreshedAt = 0;
     log('updated recipe', saved.uid, changed.join(','));
-    return `Updated ${changed.join(', ')}.\n\n${formatRecipe(saved)}`;
+    const catLine = `categories: ${this.categoryNames(saved).join(', ') || '(none)'}`;
+    return `Updated ${changed.join(', ')}.\n${catLine}\n\n${formatRecipe(saved)}`;
   }
 
   async callTool(name, args = {}) {
@@ -298,6 +415,8 @@ class RecipeServer {
       case 'get_paprika_recipe': return this.get(args);
       case 'create_paprika_recipe': return this.create(args);
       case 'update_paprika_recipe': return this.update(args);
+      case 'list_paprika_categories': return this.listCategories();
+      case 'create_paprika_category': return this.createCategory(args);
       default: throw new Error(`unknown tool: ${name}`);
     }
   }

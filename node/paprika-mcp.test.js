@@ -5,8 +5,9 @@ const assert = require('node:assert');
 const zlib = require('node:zlib');
 const { PaprikaClient, RecipeServer, recipeHash } = require('./paprika-mcp.js');
 
-function fakeApi(recipes) {
+function fakeApi(recipes, categories = [{ uid: 'CAT1', name: 'Soups', order_flag: 0, parent_uid: null }]) {
   const calls = [];
+  calls.categories = categories;
   const fetchImpl = async (url, init = {}) => {
     calls.push({ url, method: init.method, init });
     const ok = (result) => ({ ok: true, status: 200, json: async () => ({ result }) });
@@ -16,6 +17,14 @@ function fakeApi(recipes) {
     }
     if (url.endsWith('/v2/sync/recipes/')) return ok(Object.values(recipes).map((r) => ({ uid: r.uid, hash: r.hash })));
     if (url.endsWith('/v2/sync/notify/')) return ok(true);
+    if (url.endsWith('/v2/sync/categories/') && init.method === 'GET') return ok(JSON.parse(JSON.stringify(categories)));
+    if (url.endsWith('/v2/sync/categories/') && init.method === 'POST') {
+      const file = init.body.get('data');
+      const posted = JSON.parse(zlib.gunzipSync(Buffer.from(await file.arrayBuffer())).toString());
+      calls.postedCategories = posted;
+      categories.push(...posted);
+      return ok(true);
+    }
     const m = url.match(/\/v2\/sync\/recipe\/([^/]+)\/$/);
     if (m && init.method === 'GET') return ok(JSON.parse(JSON.stringify(recipes[decodeURIComponent(m[1])])));
     if (m && init.method === 'POST') {
@@ -126,7 +135,7 @@ test('protocol: initialize, tools/list without delete, notifications get no repl
   assert.strictEqual(await server.handle({ jsonrpc: '2.0', method: 'notifications/initialized' }), null);
   const list = await server.handle({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
   const names = list.result.tools.map((t) => t.name);
-  assert.deepStrictEqual(names.sort(), ['create_paprika_recipe', 'get_paprika_recipe', 'search_paprika_recipes', 'update_paprika_recipe']);
+  assert.deepStrictEqual(names.sort(), ['create_paprika_category', 'create_paprika_recipe', 'get_paprika_recipe', 'list_paprika_categories', 'search_paprika_recipes', 'update_paprika_recipe']);
   assert.ok(!names.some((n) => n.includes('delete')));
 });
 
@@ -135,4 +144,55 @@ test('only paprikaapp.com is contacted', async () => {
   await call(server, 'search_paprika_recipes', {});
   await call(server, 'update_paprika_recipe', { uid: 'DAL', rating: 5 });
   for (const c of api.calls) assert.match(c.url, /^https:\/\/paprikaapp\.com\/api\//);
+});
+
+test('create category, refuse duplicate', async () => {
+  const { api, server } = setup();
+  let res = await call(server, 'create_paprika_category', { name: 'GF/DF' });
+  assert.ok(!res.result.isError, res.result.content[0].text);
+  assert.strictEqual(api.calls.postedCategories[0].name, 'GF/DF');
+  assert.match(api.calls.postedCategories[0].uid, /^[0-9A-F-]{36}$/);
+  res = await call(server, 'create_paprika_category', { name: 'soups' });
+  assert.ok(res.result.isError);
+});
+
+test('categories: set, add, remove keep other fields; unknown names save nothing', async () => {
+  const { api, server } = setup();
+  await call(server, 'create_paprika_category', { name: 'GF/DF' });
+  await call(server, 'create_paprika_category', { name: 'Vegetarian & Beans' });
+  let res = await call(server, 'update_paprika_recipe', { uid: 'DAL', add_categories: ['GF/DF', 'vegetarian & beans'] });
+  assert.ok(!res.result.isError, res.result.content[0].text);
+  let s = api.calls.saved.at(-1);
+  assert.strictEqual(s.categories.length, 3);
+  assert.strictEqual(s.categories[0], 'CAT1');
+  assert.strictEqual(s.rating, 4);
+  assert.strictEqual(s.notes, 'Yukon Gold for sweet potato');
+  assert.match(res.result.content[0].text, /categories: Soups, GF\/DF, Vegetarian & Beans/);
+
+  res = await call(server, 'update_paprika_recipe', { uid: 'DAL', remove_categories: ['Soups'] });
+  s = api.calls.saved.at(-1);
+  assert.ok(!s.categories.includes('CAT1'));
+
+  res = await call(server, 'update_paprika_recipe', { uid: 'DAL', set_categories: ['Soups'] });
+  assert.deepStrictEqual(api.calls.saved.at(-1).categories, ['CAT1']);
+
+  const before = api.calls.saved.length;
+  res = await call(server, 'update_paprika_recipe', { uid: 'DAL', add_categories: ['Nope'] });
+  assert.ok(res.result.isError);
+  assert.match(res.result.content[0].text, /unknown categories: Nope/);
+  assert.strictEqual(api.calls.saved.length, before);
+});
+
+test('search by category and list counts', async () => {
+  const { server } = setup();
+  let out = (await call(server, 'search_paprika_recipes', { category: 'soups' })).result.content[0].text;
+  assert.match(out, /Masoor dal/);
+  assert.doesNotMatch(out, /noodle soup/);
+  out = (await call(server, 'search_paprika_recipes', { category: '(none)' })).result.content[0].text;
+  assert.match(out, /noodle soup/);
+  assert.doesNotMatch(out, /Masoor/);
+  const bad = await call(server, 'search_paprika_recipes', { category: 'Nope' });
+  assert.ok(bad.result.isError);
+  out = (await call(server, 'list_paprika_categories', {})).result.content[0].text;
+  assert.match(out, /Soups \(1 recipes\)/);
 });
