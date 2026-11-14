@@ -1,3 +1,7 @@
+//go:build live
+
+// Live test against the real Paprika API. Run with: go test -tags live ./internal/paprika/
+
 package paprika_test
 
 import (

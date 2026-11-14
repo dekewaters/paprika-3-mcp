@@ -13,6 +13,7 @@ import (
 	"mime/multipart"
 	"net"
 	"net/http"
+	"net/url"
 	"runtime"
 	"sort"
 	"strings"
@@ -109,8 +110,11 @@ type errorResponse struct {
 // login authenticates with the Paprika API and returns an authentication token
 // The token is used for all subsequent requests to the API. As far as I can tell, this is a JWT with no expiration.
 func login(ctx context.Context, client http.Client, username, password string) (string, error) {
-	body := fmt.Sprintf("email=%s&password=%s", username, password)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://paprikaapp.com/api/v1/account/login", bytes.NewBufferString(body))
+	// URL-encode credentials so passwords containing &, + or = still work.
+	form := url.Values{}
+	form.Set("email", username)
+	form.Set("password", password)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://paprikaapp.com/api/v1/account/login", strings.NewReader(form.Encode()))
 	if err != nil {
 		return "", err
 	}
@@ -217,6 +221,61 @@ type Recipe struct {
 	OnGroceryList   bool     `json:"on_grocery_list"`
 	Created         string   `json:"created"`
 	PhotoURL        string   `json:"photo_url"`
+
+	// extra holds any fields Paprika returns that this struct doesn't model,
+	// so saving a recipe never silently drops them.
+	extra map[string]json.RawMessage
+}
+
+// UnmarshalJSON decodes known fields and keeps every unknown one in extra.
+func (r *Recipe) UnmarshalJSON(data []byte) error {
+	type alias Recipe
+	var a alias
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	var all map[string]json.RawMessage
+	if err := json.Unmarshal(data, &all); err != nil {
+		return err
+	}
+	known, err := json.Marshal(a)
+	if err != nil {
+		return err
+	}
+	var knownKeys map[string]json.RawMessage
+	if err := json.Unmarshal(known, &knownKeys); err != nil {
+		return err
+	}
+	for k := range knownKeys {
+		delete(all, k)
+	}
+	*r = Recipe(a)
+	if len(all) > 0 {
+		r.extra = all
+	}
+	return nil
+}
+
+// MarshalJSON writes known fields plus any preserved unknown ones.
+func (r Recipe) MarshalJSON() ([]byte, error) {
+	type alias Recipe
+	known, err := json.Marshal(alias(r))
+	if err != nil {
+		return nil, err
+	}
+	if len(r.extra) == 0 {
+		return known, nil
+	}
+	var merged map[string]json.RawMessage
+	if err := json.Unmarshal(known, &merged); err != nil {
+		return nil, err
+	}
+	for k, v := range r.extra {
+		if _, exists := merged[k]; !exists {
+			merged[k] = v
+		}
+	}
+	return json.Marshal(merged)
 }
 
 func (r *Recipe) ResourceDescription() string {
@@ -292,7 +351,12 @@ func (r *Recipe) generateUUID() {
 	r.UID = strings.ToUpper(r.UID)
 }
 
+// updateCreated stamps a creation time on new recipes only. Existing recipes keep
+// their original created date.
 func (r *Recipe) updateCreated() {
+	if r.Created != "" {
+		return
+	}
 	layout := "2006-01-02 15:04:05"
 	r.Created = time.Now().Format(layout)
 }

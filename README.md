@@ -1,3 +1,34 @@
+# paprika-3-mcp (hardened fork)
+
+Fork of [soggycactus/paprika-3-mcp](https://github.com/soggycactus/paprika-3-mcp). Changes in this fork:
+
+- **Tools instead of resources.** `search_paprika_recipes` and `get_paprika_recipe` replace the MCP resources, which many clients don't surface. The old background loop that re-downloaded every recipe once a minute is gone; search keeps an index and only refetches recipes whose hash changed.
+- **Safe updates.** `update_paprika_recipe` loads the current recipe and changes only the fields you pass. Photo, rating, categories, created date and any fields Paprika adds later are kept. `append_notes` adds to notes without replacing them. Trashed recipes are never updated.
+- **No delete tool.**
+- **Credentials from environment only**: `PAPRIKA_USERNAME` and `PAPRIKA_PASSWORD`. The `-username` / `-password` flags are removed so the password never appears in a process list. The login form is URL-encoded, so passwords with `&`, `+` or `=` work.
+- **Logs to stderr** (Claude Desktop captures it). The lumberjack dependency is removed.
+- Unit tests for update merging, search and the cache (`go test ./...`). The original live API test needs `-tags live`.
+
+## Claude Desktop config (Windows)
+
+```json
+{
+  "mcpServers": {
+    "paprika": {
+      "command": "C:\\Users\\<you>\\bin\\paprika-3-mcp.exe",
+      "env": {
+        "PAPRIKA_USERNAME": "you@example.com",
+        "PAPRIKA_PASSWORD": "set this yourself"
+      }
+    }
+  }
+}
+```
+
+---
+
+Original README follows. Its tool list and `-username`/`-password` install steps no longer apply to this fork.
+
 # paprika-3-mcp
 
 A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/introduction) server that exposes your **Paprika 3** recipes as LLM-readable resources — and lets an LLM like Claude create or update recipes in your Paprika app.

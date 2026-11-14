@@ -6,7 +6,6 @@ toolchain go1.23.8
 
 require github.com/google/uuid v1.6.0
 
-require gopkg.in/natefinch/lumberjack.v2 v2.2.1
 
 require (
 	github.com/mark3labs/mcp-go v0.18.0
