@@ -9,7 +9,19 @@ Fork of [soggycactus/paprika-3-mcp](https://github.com/soggycactus/paprika-3-mcp
 - **Logs to stderr** (Claude Desktop captures it). The lumberjack dependency is removed.
 - Unit tests for update merging, search and the cache (`go test ./...`). The original live API test needs `-tags live`.
 
-## Claude Desktop config (Windows)
+## Node version (for Windows with Smart App Control)
+
+Smart App Control blocks unsigned executables, including the Go build. `node/paprika-mcp.js` is the same server as one file with no dependencies, run by the signed `node.exe` (Node 18+). Same four tools, same merge-only updates, no delete tool, credentials from env, only contacts paprikaapp.com. Tests: `node --test node/paprika-mcp.test.js`.
+
+```json
+"paprika": {
+  "command": "node",
+  "args": ["C:\\Users\\<you>\\.local\\bin\\paprika-mcp.js"],
+  "env": { "PAPRIKA_USERNAME": "you@example.com", "PAPRIKA_PASSWORD": "set this yourself" }
+}
+```
+
+## Claude Desktop config (Windows, Go build)
 
 ```json
 {
